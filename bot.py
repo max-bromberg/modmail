@@ -1,26 +1,28 @@
-__version__ = "4.0.0-dev11"
+__version__ = "4.1.0"
 
 
 import asyncio
 import copy
+import hashlib
 import logging
 import os
 import re
 import string
 import struct
 import sys
+import platform
 import typing
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from subprocess import PIPE
 from types import SimpleNamespace
 
 import discord
 import isodate
-from aiohttp import ClientSession
+from aiohttp import ClientSession, ClientResponseError
 from discord.ext import commands, tasks
 from discord.ext.commands.view import StringView
-from emoji import UNICODE_EMOJI
-from pkg_resources import parse_version
+from emoji import is_emoji
+from packaging.version import Version
 
 
 try:
@@ -46,10 +48,9 @@ from core.models import (
 )
 from core.thread import ThreadManager
 from core.time import human_timedelta
-from core.utils import normalize_alias, parse_alias, truncate, tryint
+from core.utils import extract_block_timestamp, normalize_alias, parse_alias, truncate, tryint, human_join
 
 logger = getLogger(__name__)
-
 
 temp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp")
 if not os.path.exists(temp_dir):
@@ -64,26 +65,43 @@ if sys.platform == "win32":
 
 class ModmailBot(commands.Bot):
     def __init__(self):
+        self.config = ConfigManager(self)
+        self.config.populate_cache()
+
         intents = discord.Intents.all()
+        if not self.config["enable_presence_intent"]:
+            intents.presences = False
+
         super().__init__(command_prefix=None, intents=intents)  # implemented in `get_prefix`
         self.session = None
         self._api = None
         self.formatter = SafeFormatter()
         self.loaded_cogs = ["cogs.modmail", "cogs.plugins", "cogs.utility"]
-        self._connected = asyncio.Event()
+        self._connected = None
         self.start_time = discord.utils.utcnow()
         self._started = False
 
-        self.config = ConfigManager(self)
-        self.config.populate_cache()
-
         self.threads = ThreadManager(self)
 
-        self.log_file_name = os.path.join(temp_dir, f"{self.token.split('.')[0]}.log")
-        self._configure_logging()
+        log_dir = os.path.join(temp_dir, "logs")
+        if not os.path.exists(log_dir):
+            os.mkdir(log_dir)
+        self.log_file_path = os.path.join(log_dir, "modmail.log")
+        configure_logging(self)
 
         self.plugin_db = PluginDatabaseClient(self)  # Deprecated
         self.startup()
+
+    def get_guild_icon(
+        self, guild: typing.Optional[discord.Guild], *, size: typing.Optional[int] = None
+    ) -> str:
+        if guild is None:
+            guild = self.guild
+        if guild.icon is None:
+            return "https://cdn.discordapp.com/embed/avatars/0.png"
+        if size is None:
+            return guild.icon.url
+        return guild.icon.with_size(size).url
 
     def _resolve_snippet(self, name: str) -> typing.Optional[str]:
         """
@@ -156,6 +174,8 @@ class ModmailBot(commands.Bot):
 
     async def load_extensions(self):
         for cog in self.loaded_cogs:
+            if cog in self.extensions:
+                continue
             logger.debug("Loading %s.", cog)
             try:
                 await self.load_extension(cog)
@@ -164,32 +184,9 @@ class ModmailBot(commands.Bot):
                 logger.exception("Failed to load %s.", cog)
         logger.line("debug")
 
-    def _configure_logging(self):
-        level_text = self.config["log_level"].upper()
-        logging_levels = {
-            "CRITICAL": logging.CRITICAL,
-            "ERROR": logging.ERROR,
-            "WARNING": logging.WARNING,
-            "INFO": logging.INFO,
-            "DEBUG": logging.DEBUG,
-        }
-        logger.line()
-
-        log_level = logging_levels.get(level_text)
-        if log_level is None:
-            log_level = self.config.remove("log_level")
-            logger.warning("Invalid logging level set: %s.", level_text)
-            logger.warning("Using default logging level: INFO.")
-        else:
-            logger.info("Logging level: %s", level_text)
-
-        logger.info("Log file: %s", self.log_file_name)
-        configure_logging(self.log_file_name, log_level)
-        logger.debug("Successfully configured logging.")
-
     @property
     def version(self):
-        return parse_version(__version__)
+        return Version(__version__)
 
     @property
     def api(self) -> ApiClient:
@@ -212,28 +209,16 @@ class ModmailBot(commands.Bot):
     def run(self):
         async def runner():
             async with self:
+                self._connected = asyncio.Event()
                 self.session = ClientSession(loop=self.loop)
-                try:
-                    retry_intents = False
-                    try:
-                        await self.start(self.token)
-                    except discord.PrivilegedIntentsRequired:
-                        retry_intents = True
-                    if retry_intents:
-                        await self.http.close()
-                        if self.ws is not None and self.ws.open:
-                            await self.ws.close(code=1000)
-                        self._ready.clear()
 
-                        intents = discord.Intents.default()
-                        intents.members = True
-                        intents.message_content = True
-                        # Try again with members intent
-                        self._connection._intents = intents
-                        logger.warning(
-                            "Attempting to login with only the server members and message content privileged intent. Some plugins might not work correctly."
-                        )
-                        await self.start(self.token)
+                if self.config["enable_presence_intent"]:
+                    logger.info("Starting bot with presence intent.")
+                else:
+                    logger.info("Starting bot without presence intent.")
+
+                try:
+                    await self.start(self.token)
                 except discord.PrivilegedIntentsRequired:
                     logger.critical(
                         "Privileged intents are not explicitly granted in the discord developers dashboard."
@@ -243,10 +228,10 @@ class ModmailBot(commands.Bot):
                 except Exception:
                     logger.critical("Fatal exception", exc_info=True)
                 finally:
-                    if not self.is_closed():
-                        await self.close()
                     if self.session:
                         await self.session.close()
+                    if not self.is_closed():
+                        await self.close()
 
         async def _cancel_tasks():
             async with self:
@@ -278,7 +263,7 @@ class ModmailBot(commands.Bot):
                         pass
 
         try:
-            asyncio.run(runner())
+            asyncio.run(runner(), debug=bool(os.getenv("DEBUG_ASYNCIO")))
         except (KeyboardInterrupt, SystemExit):
             logger.info("Received signal to terminate bot and event loop.")
         finally:
@@ -629,17 +614,20 @@ class ModmailBot(commands.Bot):
             )
             logger.warning("If the external servers are valid, you may ignore this message.")
 
+        self.post_metadata.start()
+        self.autoupdate.start()
+        self.log_expiry.start()
         self._started = True
 
     async def convert_emoji(self, name: str) -> str:
         ctx = SimpleNamespace(bot=self, guild=self.modmail_guild)
         converter = commands.EmojiConverter()
 
-        if name not in UNICODE_EMOJI["en"]:
+        if not is_emoji(name):
             try:
                 name = await converter.convert(ctx, name.strip(":"))
             except commands.BadArgument as e:
-                logger.warning("%s is not a valid emoji. %s.", name, e)
+                logger.warning("%s is not a valid emoji: %s", name, e)
                 raise
         return name
 
@@ -653,7 +641,6 @@ class ModmailBot(commands.Bot):
         return self.get_user(id) or await self.fetch_user(id)
 
     async def retrieve_emoji(self) -> typing.Tuple[str, str]:
-
         sent_emoji = self.config["sent_emoji"]
         blocked_emoji = self.config["blocked_emoji"]
 
@@ -727,23 +714,14 @@ class ModmailBot(commands.Bot):
         if isinstance(author, discord.Member):
             for r in author.roles:
                 if str(r.id) in self.blocked_roles:
-
                     blocked_reason = self.blocked_roles.get(str(r.id)) or ""
-                    now = discord.utils.utcnow()
 
-                    # etc "blah blah blah... until 2019-10-14T21:12:45.559948."
-                    end_time = re.search(r"until ([^`]+?)\.$", blocked_reason)
-                    if end_time is None:
-                        # backwards compat
-                        end_time = re.search(r"%([^%]+?)%", blocked_reason)
-                        if end_time is not None:
-                            logger.warning(
-                                r"Deprecated time message for role %s, block and unblock again to update.",
-                                r.name,
-                            )
+                    try:
+                        end_time, after = extract_block_timestamp(blocked_reason, author.id)
+                    except ValueError:
+                        return False
 
                     if end_time is not None:
-                        after = (datetime.fromisoformat(end_time.group(1)) - now).total_seconds()
                         if after <= 0:
                             # No longer blocked
                             self.blocked_roles.pop(str(r.id))
@@ -759,26 +737,19 @@ class ModmailBot(commands.Bot):
             return True
 
         blocked_reason = self.blocked_users.get(str(author.id)) or ""
-        now = discord.utils.utcnow()
 
         if blocked_reason.startswith("System Message:"):
             # Met the limits already, otherwise it would've been caught by the previous checks
             logger.debug("No longer internally blocked, user %s.", author.name)
             self.blocked_users.pop(str(author.id))
             return True
-        # etc "blah blah blah... until 2019-10-14T21:12:45.559948."
-        end_time = re.search(r"until ([^`]+?)\.$", blocked_reason)
-        if end_time is None:
-            # backwards compat
-            end_time = re.search(r"%([^%]+?)%", blocked_reason)
-            if end_time is not None:
-                logger.warning(
-                    r"Deprecated time message for user %s, block and unblock again to update.",
-                    author.name,
-                )
+
+        try:
+            end_time, after = extract_block_timestamp(blocked_reason, author.id)
+        except ValueError:
+            return False
 
         if end_time is not None:
-            after = (datetime.fromisoformat(end_time.group(1)) - now).total_seconds()
             if after <= 0:
                 # No longer blocked
                 self.blocked_users.pop(str(author.id))
@@ -801,7 +772,6 @@ class ModmailBot(commands.Bot):
         channel: discord.TextChannel = None,
         send_message: bool = False,
     ) -> bool:
-
         member = self.guild.get_member(author.id)
         if member is None:
             # try to find in other guilds
@@ -866,10 +836,12 @@ class ModmailBot(commands.Bot):
             return
 
         try:
-            cooldown = datetime.fromisoformat(last_log_closed_at) + thread_cooldown
+            cooldown = datetime.fromisoformat(last_log_closed_at).astimezone(timezone.utc) + thread_cooldown
         except ValueError:
             logger.warning("Error with 'thread_cooldown'.", exc_info=True)
-            cooldown = datetime.fromisoformat(last_log_closed_at) + self.config.remove("thread_cooldown")
+            cooldown = datetime.fromisoformat(last_log_closed_at).astimezone(
+                timezone.utc
+            ) + self.config.remove("thread_cooldown")
 
         if cooldown > now:
             # User messaged before thread cooldown ended
@@ -885,7 +857,7 @@ class ModmailBot(commands.Bot):
         if reaction != "disable":
             try:
                 await msg.add_reaction(reaction)
-            except (discord.HTTPException, discord.InvalidArgument) as e:
+            except (discord.HTTPException, TypeError) as e:
                 logger.warning("Failed to add reaction %s: %s.", reaction, e)
                 return False
         return True
@@ -897,7 +869,7 @@ class ModmailBot(commands.Bot):
             return
         sent_emoji, blocked_emoji = await self.retrieve_emoji()
 
-        if message.type != discord.MessageType.default:
+        if message.type not in [discord.MessageType.default, discord.MessageType.reply]:
             return
 
         thread = await self.threads.find(recipient=message.author)
@@ -919,7 +891,10 @@ class ModmailBot(commands.Bot):
                     color=self.error_color,
                     description=self.config["disabled_new_thread_response"],
                 )
-                embed.set_footer(text=self.config["disabled_new_thread_footer"], icon_url=self.guild.icon.url)
+                embed.set_footer(
+                    text=self.config["disabled_new_thread_footer"],
+                    icon_url=self.get_guild_icon(guild=message.guild, size=128),
+                )
                 logger.info("A new thread was blocked from %s due to disabled Modmail.", message.author)
                 await self.add_reaction(message, blocked_emoji)
                 return await message.channel.send(embed=embed)
@@ -934,7 +909,7 @@ class ModmailBot(commands.Bot):
                 )
                 embed.set_footer(
                     text=self.config["disabled_current_thread_footer"],
-                    icon_url=self.guild.icon.url,
+                    icon_url=self.get_guild_icon(guild=message.guild, size=128),
                 )
                 logger.info("A message was blocked from %s due to disabled Modmail.", message.author)
                 await self.add_reaction(message, blocked_emoji)
@@ -994,7 +969,8 @@ class ModmailBot(commands.Bot):
         # This needs to be done before checking for aliases since
         # snippets can have multiple words.
         try:
-            snippet_text = self.snippets[message.content.removeprefix(invoked_prefix)]
+            # Use removeprefix once PY3.9+
+            snippet_text = self.snippets[message.content[len(invoked_prefix) :]]
         except KeyError:
             snippet_text = None
 
@@ -1098,7 +1074,7 @@ class ModmailBot(commands.Bot):
         view = StringView(message.content)
         ctx = cls(prefix=self.prefix, view=view, bot=self, message=message)
 
-        if self._skip_check(message.author.id, self.user.id):
+        if message.author.id == self.user.id:
             return ctx
 
         ctx.thread = await self.threads.find(channel=ctx.channel)
@@ -1226,7 +1202,7 @@ class ModmailBot(commands.Bot):
             thread = await self.threads.find(recipient=user)
 
             if thread:
-                await thread.channel.trigger_typing()
+                await thread.channel.typing()
         else:
             if not self.config.get("mod_typing"):
                 return
@@ -1236,7 +1212,7 @@ class ModmailBot(commands.Bot):
                 for user in thread.recipients:
                     if await self.is_blocked(user):
                         continue
-                    await user.trigger_typing()
+                    await user.typing()
 
     async def handle_reaction_events(self, payload):
         user = self.get_user(payload.user_id)
@@ -1244,25 +1220,36 @@ class ModmailBot(commands.Bot):
             return
 
         channel = self.get_channel(payload.channel_id)
-        if not channel:  # dm channel not in internal cache
-            _thread = await self.threads.find(recipient=user)
-            if not _thread:
+        thread = None
+        # dm channel not in internal cache
+        if not channel:
+            thread = await self.threads.find(recipient=user)
+            if not thread:
                 return
-            channel = await _thread.recipient.create_dm()
+            channel = await thread.recipient.create_dm()
+            if channel.id != payload.channel_id:
+                return
 
+        from_dm = isinstance(channel, discord.DMChannel)
+        from_txt = isinstance(channel, discord.TextChannel)
+        if not from_dm and not from_txt:
+            return
+
+        if not thread:
+            params = {"recipient": user} if from_dm else {"channel": channel}
+            thread = await self.threads.find(**params)
+            if not thread:
+                return
+
+        # thread must exist before doing this API call
         try:
             message = await channel.fetch_message(payload.message_id)
         except (discord.NotFound, discord.Forbidden):
             return
 
         reaction = payload.emoji
-
         close_emoji = await self.convert_emoji(self.config["close_emoji"])
-
-        if isinstance(channel, discord.DMChannel):
-            thread = await self.threads.find(recipient=user)
-            if not thread:
-                return
+        if from_dm:
             if (
                 payload.event_type == "REACTION_ADD"
                 and message.embeds
@@ -1270,7 +1257,7 @@ class ModmailBot(commands.Bot):
                 and self.config.get("recipient_thread_close")
             ):
                 ts = message.embeds[0].timestamp
-                if thread and ts == thread.channel.created_at:
+                if ts == thread.channel.created_at:
                     # the reacted message is the corresponding thread creation embed
                     # closing thread
                     return await thread.close(closer=user)
@@ -1290,11 +1277,10 @@ class ModmailBot(commands.Bot):
                 logger.warning("Failed to find linked message for reactions: %s", e)
                 return
         else:
-            thread = await self.threads.find(channel=channel)
-            if not thread:
-                return
             try:
-                _, *linked_messages = await thread.find_linked_messages(message.id, either_direction=True)
+                _, *linked_messages = await thread.find_linked_messages(
+                    message1=message, either_direction=True
+                )
             except ValueError as e:
                 logger.warning("Failed to find linked message for reactions: %s", e)
                 return
@@ -1309,7 +1295,7 @@ class ModmailBot(commands.Bot):
                     for msg in linked_messages:
                         await msg.remove_reaction(reaction, self.user)
                     await message.remove_reaction(reaction, self.user)
-                except (discord.HTTPException, discord.InvalidArgument) as e:
+                except (discord.HTTPException, TypeError) as e:
                     logger.warning("Failed to remove reaction: %s", e)
 
     async def handle_react_to_contact(self, payload):
@@ -1340,7 +1326,7 @@ class ModmailBot(commands.Bot):
             )
             embed.set_footer(
                 text=self.config["disabled_new_thread_footer"],
-                icon_url=self.guild.icon.url,
+                icon_url=self.get_guild_icon(guild=channel.guild, size=128),
             )
             logger.info(
                 "A new thread using react to contact was blocked from %s due to disabled Modmail.",
@@ -1402,28 +1388,44 @@ class ModmailBot(commands.Bot):
             await thread.close(closer=mod, silent=True, delete_channel=False)
 
     async def on_member_remove(self, member):
-        if member.guild != self.guild:
-            return
         thread = await self.threads.find(recipient=member)
         if thread:
-            if self.config["close_on_leave"]:
+            if member.guild == self.guild and self.config["close_on_leave"]:
                 await thread.close(
                     closer=member.guild.me,
                     message=self.config["close_on_leave_reason"],
                     silent=True,
                 )
             else:
-                embed = discord.Embed(
-                    description=self.config["close_on_leave_reason"], color=self.error_color
-                )
+                if len(self.guilds) > 1:
+                    guild_left = member.guild
+                    remaining_guilds = member.mutual_guilds
+
+                    if remaining_guilds:
+                        remaining_guild_names = [guild.name for guild in remaining_guilds]
+                        leave_message = (
+                            f"The recipient has left {guild_left}. "
+                            f"They are still in {human_join(remaining_guild_names, final='and')}."
+                        )
+                    else:
+                        leave_message = (
+                            f"The recipient has left {guild_left}. We no longer share any mutual servers."
+                        )
+                else:
+                    leave_message = "The recipient has left the server."
+
+                embed = discord.Embed(description=leave_message, color=self.error_color)
                 await thread.channel.send(embed=embed)
 
     async def on_member_join(self, member):
-        if member.guild != self.guild:
-            return
         thread = await self.threads.find(recipient=member)
         if thread:
-            embed = discord.Embed(description="The recipient has joined the server.", color=self.mod_color)
+            if len(self.guilds) > 1:
+                guild_joined = member.guild
+                join_message = f"The recipient has joined {guild_joined}."
+            else:
+                join_message = "The recipient has joined the server."
+            embed = discord.Embed(description=join_message, color=self.mod_color)
             await thread.channel.send(embed=embed)
 
     async def on_message_delete(self, message):
@@ -1505,9 +1507,19 @@ class ModmailBot(commands.Bot):
         logger.error("Ignoring exception in %s.", event_method)
         logger.error("Unexpected exception:", exc_info=sys.exc_info())
 
-    async def on_command_error(self, context, exception):
+    async def on_command_error(
+        self, context: commands.Context, exception: Exception, *, unhandled_by_cog: bool = False
+    ) -> None:
+        if not unhandled_by_cog:
+            command = context.command
+            if command and command.has_error_handler():
+                return
+            cog = context.cog
+            if cog and cog.has_error_handler():
+                return
+
         if isinstance(exception, (commands.BadArgument, commands.BadUnionArgument)):
-            await context.trigger_typing()
+            await context.typing()
             await context.send(embed=discord.Embed(color=self.error_color, description=str(exception)))
         elif isinstance(exception, commands.CommandNotFound):
             logger.warning("CommandNotFound: %s", exception)
@@ -1580,6 +1592,7 @@ class ModmailBot(commands.Bot):
         await self.wait_for_connected()
         if not self.config.get("data_collection") or not self.guild:
             self.post_metadata.cancel()
+            return
 
         logger.debug("Starting metadata loop.")
         logger.line("debug")
@@ -1589,45 +1602,56 @@ class ModmailBot(commands.Bot):
         changelog = await Changelog.from_url(self)
         latest = changelog.latest_version
 
-        if self.version < parse_version(latest.version):
-            if self.hosting_method == HostingMethod.HEROKU:
+        if self.version < Version(latest.version):
+            error = None
+            data = {}
+            try:
+                # update fork if gh_token exists
                 data = await self.api.update_repository()
+            except InvalidConfigError:
+                pass
+            except ClientResponseError as exc:
+                error = exc
+            if self.hosting_method == HostingMethod.HEROKU:
+                if error is not None:
+                    logger.error(f"Autoupdate failed! Status: {error.status}.")
+                    logger.error(f"Error message: {error.message}")
+                    self.autoupdate.cancel()
+                    return
+
+                commit_data = data.get("data")
+                if not commit_data:
+                    return
+
+                logger.info("Bot has been updated.")
+
+                if not self.config["update_notifications"]:
+                    return
 
                 embed = discord.Embed(color=self.main_color)
-
-                commit_data = data["data"]
+                message = commit_data["commit"]["message"]
+                html_url = commit_data["html_url"]
+                short_sha = commit_data["sha"][:6]
                 user = data["user"]
+                embed.add_field(
+                    name="Merge Commit",
+                    value=f"[`{short_sha}`]({html_url}) " f"{message} - {user['username']}",
+                )
                 embed.set_author(
                     name=user["username"] + " - Updating Bot",
                     icon_url=user["avatar_url"],
                     url=user["url"],
                 )
 
-                embed.set_footer(text=f"Updating Modmail v{self.version} " f"-> v{latest.version}")
+                embed.set_footer(text=f"Updating Modmail v{self.version} -> v{latest.version}")
 
                 embed.description = latest.description
                 for name, value in latest.fields.items():
                     embed.add_field(name=name, value=value)
 
-                if commit_data:
-                    message = commit_data["commit"]["message"]
-                    html_url = commit_data["html_url"]
-                    short_sha = commit_data["sha"][:6]
-                    embed.add_field(
-                        name="Merge Commit",
-                        value=f"[`{short_sha}`]({html_url}) " f"{message} - {user['username']}",
-                    )
-                    logger.info("Bot has been updated.")
-                    channel = self.log_channel
-                    if self.config["update_notifications"]:
-                        await channel.send(embed=embed)
+                channel = self.update_channel
+                await channel.send(embed=embed)
             else:
-                try:
-                    # update fork if gh_token exists
-                    await self.api.update_repository()
-                except InvalidConfigError:
-                    pass
-
                 command = "git pull"
                 proc = await asyncio.create_subprocess_shell(
                     command,
@@ -1641,24 +1665,37 @@ class ModmailBot(commands.Bot):
 
                 if err and not res:
                     logger.warning(f"Autoupdate failed: {err}")
-                    self.autoupdate_loop.cancel()
+                    self.autoupdate.cancel()
                     return
 
                 elif res != "Already up to date.":
+                    if os.getenv("PIPENV_ACTIVE"):
+                        # Update pipenv if possible
+                        await asyncio.create_subprocess_shell(
+                            "pipenv sync",
+                            stderr=PIPE,
+                            stdout=PIPE,
+                        )
+                        message = ""
+                    else:
+                        message = "\n\nDo manually update dependencies if your bot has crashed."
+
                     logger.info("Bot has been updated.")
                     channel = self.update_channel
                     if self.hosting_method in (HostingMethod.PM2, HostingMethod.SYSTEMD):
                         embed = discord.Embed(title="Bot has been updated", color=self.main_color)
-                        embed.set_footer(text=f"Updating Modmail v{self.version} " f"-> v{latest.version}")
+                        embed.set_footer(
+                            text=f"Updating Modmail v{self.version} " f"-> v{latest.version} {message}"
+                        )
                         if self.config["update_notifications"]:
                             await channel.send(embed=embed)
                     else:
                         embed = discord.Embed(
                             title="Bot has been updated and is logging out.",
-                            description="If you do not have an auto-restart setup, please manually start the bot.",
+                            description=f"If you do not have an auto-restart setup, please manually start the bot. {message}",
                             color=self.main_color,
                         )
-                        embed.set_footer(text=f"Updating Modmail v{self.version} " f"-> v{latest.version}")
+                        embed.set_footer(text=f"Updating Modmail v{self.version} -> v{latest.version}")
                         if self.config["update_notifications"]:
                             await channel.send(embed=embed)
                     return await self.close()
@@ -1670,16 +1707,33 @@ class ModmailBot(commands.Bot):
 
         if self.config.get("disable_autoupdates"):
             logger.warning("Autoupdates disabled.")
-            self.autoupdate_loop.cancel()
+            self.autoupdate.cancel()
+            return
 
         if self.hosting_method == HostingMethod.DOCKER:
             logger.warning("Autoupdates disabled as using Docker.")
-            self.autoupdate_loop.cancel()
+            self.autoupdate.cancel()
+            return
 
         if not self.config.get("github_token") and self.hosting_method == HostingMethod.HEROKU:
             logger.warning("GitHub access token not found.")
             logger.warning("Autoupdates disabled.")
-            self.autoupdate_loop.cancel()
+            self.autoupdate.cancel()
+            return
+
+    @tasks.loop(hours=1, reconnect=False)
+    async def log_expiry(self):
+        log_expire_after = self.config.get("log_expiration")
+        if log_expire_after == isodate.Duration():
+            return self.log_expiry.stop()
+
+        now = discord.utils.utcnow()
+        expiration_datetime = now - log_expire_after
+        # WARNING: comparison is done lexicographically, not by date.
+        # This is fine as long as the date is in zero-padded ISO format, which it should be.
+        expired_logs = await self.db.logs.delete_many({"closed_at": {"$lte": str(expiration_datetime)}})
+
+        logger.info(f"Deleted {expired_logs.deleted_count} expired logs.")
 
     def format_channel_name(self, author, exclude_channel=None, force_null=False):
         """Sanitises a username for use with text channel names
@@ -1690,7 +1744,11 @@ class ModmailBot(commands.Bot):
         if force_null:
             name = new_name = "null"
         else:
-            if self.config["use_user_id_channel_name"]:
+            if self.config["use_random_channel_name"]:
+                to_hash = self.token.split(".")[-1] + str(author.id)
+                digest = hashlib.md5(to_hash.encode("utf8"), usedforsecurity=False)
+                name = new_name = digest.hexdigest()[-8:]
+            elif self.config["use_user_id_channel_name"]:
                 name = new_name = str(author.id)
             elif self.config["use_timestamp_channel_name"]:
                 name = new_name = author.created_at.isoformat(sep="-", timespec="minutes")
@@ -1704,9 +1762,10 @@ class ModmailBot(commands.Bot):
                 if force_null:
                     name = "null"
 
-                name = new_name = (
-                    "".join(l for l in name if l not in string.punctuation and l.isprintable()) or "null"
-                ) + f"-{author.discriminator}"
+                name = "".join(l for l in name if l not in string.punctuation and l.isprintable()) or "null"
+                if author.discriminator != "0":
+                    name += f"-{author.discriminator}"
+                new_name = name
 
         counter = 1
         existed = set(c.name for c in guild.text_channels if c != exclude_channel)
@@ -1737,31 +1796,28 @@ def main():
                 )
             else:
                 logger.error(
-                    "Unable to import cairosvg, install GTK Installer for Windows: https://github.com/tschoonj/GTK-for-Windows-Runtime-Environment-Installer/releases/latest"
+                    "Unable to import cairosvg, install GTK Installer for Windows and restart your system (https://github.com/tschoonj/GTK-for-Windows-Runtime-Environment-Installer/releases/latest)"
                 )
         else:
-            logger.error(
-                "Unable to import cairosvg, report on our support server with your OS details: https://discord.gg/etJNHCQ"
-            )
+            if "ubuntu" in platform.version().lower() or "debian" in platform.version().lower():
+                logger.error(
+                    "Unable to import cairosvg, try running `sudo apt-get install libpangocairo-1.0-0` or report on our support server with your OS details: https://discord.gg/etJNHCQ"
+                )
+            else:
+                logger.error(
+                    "Unable to import cairosvg, report on our support server with your OS details: https://discord.gg/etJNHCQ"
+                )
         sys.exit(0)
 
     # check discord version
-    if discord.__version__ != "2.0.0a":
+    discord_version = "2.3.2"
+    if discord.__version__ != discord_version:
         logger.error(
-            "Dependencies are not updated, run pipenv install. discord.py version expected 2.0.0a, received %s",
+            "Dependencies are not updated, run pipenv install. discord.py version expected %s, received %s",
+            discord_version,
             discord.__version__,
         )
         sys.exit(0)
-
-    # Set up discord.py internal logging
-    if os.environ.get("LOG_DISCORD"):
-        logger.debug(f"Discord logging enabled: {os.environ['LOG_DISCORD'].upper()}")
-        d_logger = logging.getLogger("discord")
-
-        d_logger.setLevel(os.environ["LOG_DISCORD"].upper())
-        handler = logging.FileHandler(filename="discord.log", encoding="utf-8", mode="w")
-        handler.setFormatter(logging.Formatter("%(asctime)s:%(levelname)s:%(name)s: %(message)s"))
-        d_logger.addHandler(handler)
 
     bot = ModmailBot()
     bot.run()

@@ -2,6 +2,7 @@ import base64
 import functools
 import re
 import typing
+from datetime import datetime, timezone
 from difflib import get_close_matches
 from distutils.util import strtobool as _stb  # pylint: disable=import-error
 from itertools import takewhile, zip_longest
@@ -9,6 +10,9 @@ from urllib import parse
 
 import discord
 from discord.ext import commands
+
+from core.models import getLogger
+
 
 __all__ = [
     "strtobool",
@@ -34,7 +38,15 @@ __all__ = [
     "tryint",
     "get_top_role",
     "get_joint_id",
+    "extract_block_timestamp",
+    "AcceptButton",
+    "DenyButton",
+    "ConfirmThreadCreationView",
+    "DummyParam",
 ]
+
+
+logger = getLogger(__name__)
 
 
 def strtobool(val):
@@ -115,7 +127,11 @@ def format_preview(messages: typing.List[typing.Dict[str, typing.Any]]):
             continue
         author = message["author"]
         content = str(message["content"]).replace("\n", " ")
-        name = author["name"] + "#" + str(author["discriminator"])
+
+        name = author["name"]
+        discriminator = str(author["discriminator"])
+        if discriminator != "0":
+            name += "#" + discriminator
         prefix = "[M]" if author["mod"] else "[R]"
         out += truncate(f"`{prefix} {name}:` {content}", max=75) + "\n"
 
@@ -136,13 +152,17 @@ def is_image_url(url: str, **kwargs) -> str:
     bool
         Whether the URL is a valid image URL.
     """
-    if url.startswith("https://gyazo.com") or url.startswith("http://gyazo.com"):
-        # gyazo support
-        url = re.sub(
-            r"(http[s]?:\/\/)((?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*(),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+)",
-            r"\1i.\2.png",
-            url,
-        )
+    try:
+        result = parse.urlparse(url)
+        if result.netloc == "gyazo.com" and result.scheme in ["http", "https"]:
+            # gyazo support
+            url = re.sub(
+                r"(https?://)((?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*(),]|%[0-9a-fA-F][0-9a-fA-F])+)",
+                r"\1i.\2.png",
+                url,
+            )
+    except ValueError:
+        pass
 
     return parse_image_url(url, **kwargs)
 
@@ -172,10 +192,19 @@ def parse_image_url(url: str, *, convert_size=True) -> str:
     return ""
 
 
-def human_join(strings):
-    if len(strings) <= 2:
-        return " or ".join(strings)
-    return ", ".join(strings[: len(strings) - 1]) + " or " + strings[-1]
+def human_join(seq: typing.Sequence[str], delim: str = ", ", final: str = "or") -> str:
+    """https://github.com/Rapptz/RoboDanny/blob/bf7d4226350dff26df4981dd53134eeb2aceeb87/cogs/utils/formats.py#L21-L32"""
+    size = len(seq)
+    if size == 0:
+        return ""
+
+    if size == 1:
+        return seq[0]
+
+    if size == 2:
+        return f"{seq[0]} {final} {seq[1]}"
+
+    return delim.join(seq[:-1]) + f" {final} {seq[-1]}"
 
 
 def days(day: typing.Union[str, int]) -> str:
@@ -397,7 +426,7 @@ def format_description(i, names):
 def trigger_typing(func):
     @functools.wraps(func)
     async def wrapper(self, ctx: commands.Context, *args, **kwargs):
-        await ctx.trigger_typing()
+        await ctx.typing()
         return await func(self, ctx, *args, **kwargs)
 
     return wrapper
@@ -432,6 +461,7 @@ async def create_thread_channel(bot, recipient, category, overwrites, *, name=No
             name=name,
             category=category,
             overwrites=overwrites,
+            topic=f"User ID: {recipient.id}",
             reason="Creating a thread channel.",
         )
     except discord.HTTPException as e:
@@ -451,7 +481,7 @@ async def create_thread_channel(bot, recipient, category, overwrites, *, name=No
 
             if not fallback:
                 fallback = await category.clone(name="Fallback Modmail")
-                bot.config.set("fallback_category_id", str(fallback.id))
+                await bot.config.set("fallback_category_id", str(fallback.id))
                 await bot.config.update()
 
             return await create_thread_channel(
@@ -494,3 +524,86 @@ def get_joint_id(message: discord.Message) -> typing.Optional[int]:
         except ValueError:
             pass
     return None
+
+
+def extract_block_timestamp(reason, id_):
+    # etc "blah blah blah... until <t:XX:f>."
+    now = discord.utils.utcnow()
+    end_time = re.search(r"until <t:(\d+):(?:R|f)>.$", reason)
+    attempts = [
+        # backwards compat
+        re.search(r"until ([^`]+?)\.$", reason),
+        re.search(r"%([^%]+?)%", reason),
+    ]
+    after = None
+    if end_time is None:
+        for i in attempts:
+            if i is not None:
+                end_time = i
+                break
+
+        if end_time is not None:
+            # found a deprecated version
+            try:
+                after = (
+                    datetime.fromisoformat(end_time.group(1)).replace(tzinfo=timezone.utc) - now
+                ).total_seconds()
+            except ValueError:
+                logger.warning(
+                    r"Broken block message for user %s, block and unblock again with a different message to prevent further issues",
+                    id_,
+                )
+                raise
+            logger.warning(
+                r"Deprecated time message for user %s, block and unblock again to update.",
+                id_,
+            )
+    else:
+        try:
+            after = (
+                datetime.utcfromtimestamp(int(end_time.group(1))).replace(tzinfo=timezone.utc) - now
+            ).total_seconds()
+        except ValueError:
+            logger.warning(
+                r"Broken block message for user %s, block and unblock again with a different message to prevent further issues",
+                id_,
+            )
+            raise
+
+    return end_time, after
+
+
+class AcceptButton(discord.ui.Button):
+    def __init__(self, emoji):
+        super().__init__(style=discord.ButtonStyle.gray, emoji=emoji)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.value = True
+        await interaction.response.edit_message(view=None)
+        self.view.stop()
+
+
+class DenyButton(discord.ui.Button):
+    def __init__(self, emoji):
+        super().__init__(style=discord.ButtonStyle.gray, emoji=emoji)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.value = False
+        await interaction.response.edit_message(view=None)
+        self.view.stop()
+
+
+class ConfirmThreadCreationView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=20)
+        self.value = None
+
+
+class DummyParam:
+    """
+    A dummy parameter that can be used for MissingRequiredArgument.
+    """
+
+    def __init__(self, name):
+        self.name = name
+        self.displayed_name = name
